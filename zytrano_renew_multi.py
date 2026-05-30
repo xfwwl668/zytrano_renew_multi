@@ -244,7 +244,7 @@ def login(page, account: dict) -> bool:
         if is_logged_in_page(page): return True
 
         try:
-            page.wait_for_selector('input', timeout=8000)
+            page.wait_for_selector('input[placeholder]', timeout=8000)
             human_delay(0.5, 1.0)
 
             # 阶梯型用户名输入容错
