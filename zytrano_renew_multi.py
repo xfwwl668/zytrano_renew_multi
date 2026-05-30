@@ -341,20 +341,23 @@ def run_for_account(page, account: dict) -> str:
         log.info(f"⏳ 容器 [{s['name']}] 续期前解析天数: {old_days:.4f} 天 ({old_time_str})")
         
         # 【修复硬伤3】前置探针检查：确认 window.handleServerRenew 挂载就绪
-        fn_exists = js_eval(page, "() => typeof window.handleServerRenew === 'function'")
-        if not fn_exists:
-            log.error(f"❌ 目标页面中 handleServerRenew 全局核心续期函数丢失或未渲染完成")
-            results.append({"name": s["name"], "success": False, "time_str": old_time_str, "err_msg": "JS核心函数丢失"})
-            continue
 
-        # 【修复硬伤4】安全求值重构：拒绝手工 format 拼接字符串，使用原生 args[0] 参数安全代理
+            # 直接使用 Playwright 物理定位包含 handleServerRenew('ID') 的原生按钮，100% 绕过全局函数限制
         try:
-            page.evaluate("id => window.handleServerRenew(id)", target_id)
-            log.info(f"-> 续期 JS 底层指令安全投喂发射成功，正在等待交互模态窗口...")
+            # 寻找页面上带有对应 target_id 续期属性的按钮或链接并点击
+            renew_btn = page.locator(f"*[onclick*='{target_id}']").first
+            if renew_btn.is_visible():
+                renew_btn.click(timeout=5000)
+                log.info(f"-> 成功通过 DOM 物理点击触发容器 [{s['name']}] 的续期弹窗")
+            else:
+                # 如果 onclick 不在当前层，尝试降级点击当前服务器索引行的常规 Renew 按钮
+                log.warning(f"⚠️ 未找到精准 ID 按钮，尝试通过行索引 [{s['index']}] 模拟点击")
+                page.get_by_role("button", name=re.compile("Renew", re.I)).nth(s['index']).click(timeout=5000)
         except Exception as e:
-            log.error(f"❌ 续期 JS 指令执行期发生异常阻断: {e}")
-            results.append({"name": s["name"], "success": False, "time_str": old_time_str, "err_msg": "JS执行抛错"})
+            log.error(f"❌ 触发续期点击交互时发生异常: {e}")
+            results.append({"name": s["name"], "success": False, "time_str": old_time_str, "err_msg": "点击触发失败"})
             continue
+            
 
         time.sleep(2)
         click_confirm_modal_if_exists(page)
