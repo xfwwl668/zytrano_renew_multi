@@ -5,6 +5,13 @@ on:
     - cron: '0 2 */2 * *'  # 每两天 UTC 02:00（北京时间 10:00）自动触发一次
   workflow_dispatch:       # 允许你在 GitHub 页面上手动点击按钮触发
 
+permissions:
+  contents: read
+  actions: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   renew:
     runs-on: ubuntu-latest
