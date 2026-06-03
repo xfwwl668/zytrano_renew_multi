@@ -34,6 +34,10 @@ SERVERS_URL = f"{BASE_URL}/servers"
 SCREENSHOT_DIR = Path("./screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
+RENEW_SUCCESS_INCREMENT_DAYS = 0.5
+RENEW_NEAR_LIMIT_DAYS = 13.5
+RENEW_TIME_TOLERANCE_DAYS = 0.03
+
 
 # ── 严格类型账号清洗器 ──────────────────────────────────────
 def load_accounts() -> list[dict]:
@@ -112,6 +116,9 @@ def human_delay(min_s=0.5, max_s=1.2):
 def js_eval(page, script: str, *args):
     try: return page.evaluate(script, *args)
     except Exception: return None
+
+def safe_name(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", value or "unknown")[:32] or "unknown"
 
 def parse_days_remaining(suspended_in: str) -> float:
     days = hours = minutes = 0.0
@@ -302,19 +309,108 @@ def get_servers_info(page) -> list[dict]:
         })
     return servers
 
-def click_confirm_modal_if_exists(page) -> bool:
-    confirm_texts = ["Yes, renew it!", "Yes, renew it", "Confirm", "OK"]
-    for btn_text in confirm_texts:
-        try:
-            btn = page.get_by_role("button", name=btn_text)
-            if btn.is_visible():
-                btn.click(timeout=2000)
-                log.info(f"-> 成功触发二层卡片弹窗点击: '{btn_text}'")
-                time.sleep(2)
-                return True
-        except Exception:
-            pass
+def click_confirm_modal_if_exists(page, tag: str = "renew_confirm", timeout: int = 15, required: bool = True) -> bool:
+    """点击续期后的二次确认弹窗。
+
+    旧逻辑只用精确文本匹配，SweetAlert2 / Bootstrap 弹窗只要按钮文本、ARIA 名称、
+    空格或标点稍有变化，就会静默返回 False，导致日志看起来“点击了 Renew”，
+    但实际没有提交最终确认。
+    """
+    role_patterns = [
+        re.compile(r"yes\s*,?\s*renew\s*it!?", re.I),
+        re.compile(r"confirm|ok|continue", re.I),
+    ]
+
+    deadline = time.time() + timeout
+    last_probe = None
+    while time.time() < deadline:
+        for pattern in role_patterns:
+            try:
+                btn = page.get_by_role("button", name=pattern).first
+                if btn.is_visible():
+                    btn.click(timeout=3000)
+                    log.info(f"-> 成功通过 ARIA 模式触发二层确认按钮: /{pattern.pattern}/")
+                    time.sleep(2)
+                    return True
+            except Exception:
+                pass
+
+        probe = js_eval(page, r"""
+            () => {
+                const normalize = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const st = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return st && st.display !== 'none' && st.visibility !== 'hidden'
+                        && Number(st.opacity || 1) > 0
+                        && rect.width > 0 && rect.height > 0;
+                };
+                const textOf = (el) => normalize(
+                    el.innerText || el.value || el.getAttribute('aria-label') ||
+                    el.getAttribute('title') || el.textContent || ''
+                );
+
+                const roots = Array.from(document.querySelectorAll(
+                    '.swal2-container, .swal2-popup, .modal.show, .modal[style*="display: block"], [role="dialog"]'
+                )).filter(visible);
+
+                const directConfirm = Array.from(document.querySelectorAll('.swal2-confirm, button.swal2-confirm'))
+                    .filter(visible)
+                    .map((el) => ({ el, text: textOf(el), selector: '.swal2-confirm' }));
+
+                const scopedButtons = roots.flatMap((root) => Array.from(root.querySelectorAll(
+                    'button, [role="button"], input[type="button"], input[type="submit"], a'
+                )).filter(visible).map((el) => ({ el, text: textOf(el), selector: 'dialog scoped button' })));
+
+                const candidates = [...directConfirm, ...scopedButtons];
+                const target = candidates.find((item) =>
+                    /yes\s*,?\s*renew\s*it!?/i.test(item.text) ||
+                    /confirm|ok|continue/i.test(item.text) ||
+                    item.selector === '.swal2-confirm'
+                );
+
+                if (target) {
+                    target.el.scrollIntoView({ block: 'center', inline: 'center' });
+                    target.el.click();
+                    return { clicked: true, via: target.selector, text: target.text };
+                }
+
+                return {
+                    clicked: false,
+                    visibleDialogCount: roots.length,
+                    candidates: candidates.slice(0, 8).map((item) => ({
+                        text: item.text,
+                        selector: item.selector,
+                    })),
+                };
+            }
+        """)
+        last_probe = probe
+        if isinstance(probe, dict) and probe.get("clicked"):
+            log.info(f"-> 成功通过 JS 弹窗扫描触发二层确认按钮: {probe.get('text') or probe.get('via')}")
+            time.sleep(2)
+            return True
+
+        time.sleep(0.5)
+
+    if required:
+        log.error(f"❌ 未能在 {timeout} 秒内定位/点击续期二次确认按钮。最后探测: {last_probe}")
+        take_screenshot(page, f"{safe_name(tag)}_confirm_missing")
+    else:
+        log.info(f"ℹ️ 未观察到续期二次确认按钮，当前属于近满期探测场景，交由续期后剩余时间判定。最后探测: {last_probe}")
     return False
+
+def judge_renew_result(old_days: float, new_days: float, confirm_clicked: bool) -> tuple[bool, str]:
+    if new_days > (old_days + RENEW_SUCCESS_INCREMENT_DAYS):
+        return True, "剩余时间已明显增加"
+    if old_days >= RENEW_NEAR_LIMIT_DAYS and new_days >= (old_days - RENEW_TIME_TOLERANCE_DAYS):
+        if confirm_clicked:
+            return True, "二次确认已提交；剩余时间接近 14 天上限，页面可能不会出现大于 0.5 天的增量"
+        return True, "当前剩余时间已接近 14 天上限；未观察到二次确认提交，但平台可能不会继续增加时间，按健康状态处理"
+    if not confirm_clicked:
+        return False, "二次确认按钮未点击，续期请求大概率没有提交"
+    return False, "二次确认已点击，但剩余时间未增加"
 
 
 # ── 单个账号核心闭环 (已修复：采用拟人化物理按钮点击，避开 window 函数找不到的硬阻断) ──
@@ -349,10 +445,16 @@ def run_for_account(page, account: dict) -> str:
             results.append({"name": s["name"], "success": False, "time_str": old_time_str, "err_msg": "点击触发失败"})
             continue
 
-        time.sleep(2)
-        click_confirm_modal_if_exists(page)
+        time.sleep(1)
+        near_limit_before = old_days >= RENEW_NEAR_LIMIT_DAYS
+        confirm_clicked = click_confirm_modal_if_exists(
+            page,
+            tag=f"renew_{safe_name(username)}_{s['index']}",
+            timeout=4 if near_limit_before else 15,
+            required=not near_limit_before,
+        )
         
-        time.sleep(3)
+        time.sleep(4)
         navigate(page, SERVERS_URL)
         time.sleep(2)
         
@@ -375,18 +477,29 @@ def run_for_account(page, account: dict) -> str:
         new_days = parse_days_remaining(new_time_str)
         log.info(f"⏳ 容器 [{s['name']}] 续期后解析天数: {new_days:.4f} 天 ({new_time_str})")
 
-        # 严格浮点增量断言 (增加超过 0.5 天才算成功)
-        is_real_success = (new_days > (old_days + 0.5))
+        is_real_success, renew_note = judge_renew_result(old_days, new_days, confirm_clicked)
+        if is_real_success:
+            log.info(f"✅ 容器 [{s['name']}] 判定为健康/成功: {renew_note}")
+        elif not confirm_clicked:
+            log.error(f"❌ 容器 [{s['name']}] 未完成二次确认点击，且剩余时间未达到近满期健康阈值。")
+        else:
+            log.error(f"❌ 容器 [{s['name']}] 二次确认已点击，但续期后状态未通过判定: {renew_note}")
 
         results.append({
             "name": s["name"],
             "success": is_real_success,
-            "time_str": new_time_str
+            "time_str": new_time_str,
+            "note": renew_note,
         })
 
     lines = [f"👤 账号: {mask(username)}"]
     for r in results:
-        err_suffix = f" ({r['err_msg']})" if "err_msg" in r else ""
+        suffix_items = []
+        if r.get("note"):
+            suffix_items.append(r["note"])
+        if r.get("err_msg"):
+            suffix_items.append(r["err_msg"])
+        err_suffix = f" ({'；'.join(suffix_items)})" if suffix_items else ""
         status = "✅ 续期成功" if r["success"] else "❌ 续期失败"
         lines.append(f"  {status} [{r['name']}] -> 剩余到期时间: {r['time_str']}{err_suffix}")
     return "\n".join(lines)
@@ -471,8 +584,10 @@ def main():
     
     if has_any_error:
         wxpush(f"🚨 Zytrano 挂机运维简报-异常或失败审计\n\n{final_msg}")
+        return 1
     else:
         log.info("🎉 完美大满贯！所有账号均已实质性增量续期完毕。保持静默。")
+        return 0
 
 
 def wxpush(content: str):
@@ -498,4 +613,4 @@ def wxpush(content: str):
         log.warning(f"📨 WxPusher 推送异常: {e}")
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
