@@ -34,9 +34,9 @@ SERVERS_URL = f"{BASE_URL}/servers"
 SCREENSHOT_DIR = Path("./screenshots")
 SCREENSHOT_DIR.mkdir(exist_ok=True)
 
-RENEW_SUCCESS_INCREMENT_DAYS = 0.5
 RENEW_NEAR_LIMIT_DAYS = 13.5
 RENEW_TIME_TOLERANCE_DAYS = 0.03
+RENEW_NOTICE_TIMEOUT = 12
 
 
 # ── 严格类型账号清洗器 ──────────────────────────────────────
@@ -309,6 +309,186 @@ def get_servers_info(page) -> list[dict]:
         })
     return servers
 
+def page_has_cancel_state(page) -> bool:
+    text = get_text(page)
+    return bool(re.search(
+        r"cancell(?:ed|ation|ing)\s+(?:pending|scheduled|requested)|"
+        r"server\s+cancell(?:ed|ation|ing)|"
+        r"pending\s+cancell(?:ation|ed)",
+        text,
+        re.I,
+    ))
+
+def click_renew_button(page, server: dict) -> bool:
+    """点击当前服务器的续期按钮。
+
+    优先选择 handleServerRenew(server_id)，这是最安全路径；
+    如果页面后续改版导致按钮没有 onclick，再降级为严格文本 Renew / Renew Server，
+    但始终过滤 cancel/delete/terminate 等危险动作。
+    """
+    target_id = server["server_id"]
+    probe = js_eval(page, r"""
+        (payload) => {
+            const serverId = String(payload.serverId || '');
+            const serverIndex = Number(payload.serverIndex || 0);
+            const normalize = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+            const visible = (el) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return st && st.display !== 'none' && st.visibility !== 'hidden'
+                    && Number(st.opacity || 1) > 0
+                    && rect.width > 0 && rect.height > 0;
+            };
+            const textOf = (el) => normalize(
+                el.innerText || el.value || el.getAttribute('aria-label') ||
+                el.getAttribute('title') || el.textContent || ''
+            );
+            const rejectRe = /cancel|delete|remove|terminate|destroy|suspend/i;
+
+            const items = Array.from(document.querySelectorAll('[onclick]')).map((el) => {
+                const onclick = el.getAttribute('onclick') || '';
+                const text = textOf(el);
+                return { el, onclick, text, visible: visible(el) };
+            }).filter((item) => item.onclick.includes(serverId) && /handleServerRenew\s*\(/i.test(item.onclick));
+
+            let candidates = items.filter((item) =>
+                item.visible &&
+                !rejectRe.test(`${item.onclick} ${item.text}`)
+            );
+
+            let mode = 'handleServerRenew';
+            if (!candidates.length) {
+                const textItems = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')).map((el) => {
+                    const onclick = el.getAttribute('onclick') || '';
+                    const text = textOf(el);
+                    return { el, onclick, text, visible: visible(el) };
+                }).filter((item) =>
+                    item.visible &&
+                    /^(renew|renew server)$/i.test(item.text) &&
+                    !rejectRe.test(`${item.onclick} ${item.text}`)
+                );
+                candidates = textItems;
+                mode = 'strictTextFallback';
+            }
+
+            const target = candidates[Math.min(serverIndex, Math.max(candidates.length - 1, 0))];
+            if (!target) {
+                return {
+                    found: false,
+                    mode,
+                    candidates: items.slice(0, 10).map((item) => ({
+                        text: item.text,
+                        onclick: item.onclick,
+                        visible: item.visible,
+                    })),
+                };
+            }
+
+            target.el.scrollIntoView({ block: 'center', inline: 'center' });
+            const rect = target.el.getBoundingClientRect();
+            return {
+                found: true,
+                mode,
+                text: target.text,
+                onclick: target.onclick,
+                x: rect.left + rect.width / 2,
+                y: rect.top + rect.height / 2,
+            };
+        }
+    """, {"serverId": target_id, "serverIndex": server["index"]})
+
+    if isinstance(probe, dict) and probe.get("found"):
+        try:
+            x, y = float(probe["x"]), float(probe["y"])
+            page.mouse.move(x, y)
+            time.sleep(random.uniform(0.2, 0.5))
+            page.mouse.click(x, y)
+            log.info(
+                f"-> 成功精准点击续期按钮 [{server['name']}]: "
+                f"mode='{probe.get('mode')}', text='{probe.get('text')}', onclick='{probe.get('onclick')}'"
+            )
+            return True
+        except Exception as e:
+            log.warning(f"⚠️ 精准续期按钮坐标点击失败，准备降级: {e}")
+
+    log.warning(f"⚠️ 未找到安全续期按钮，候选元素: {probe}")
+    take_screenshot(page, f"renew_button_missing_{server['index']}")
+    return False
+
+def wait_for_renew_notice(page, timeout: int = RENEW_NOTICE_TIMEOUT) -> dict:
+    """抓取右上角/Toast 通知，作为续期成功或失败的主判定来源。"""
+    success_re = re.compile(r"server\s+renewed|renewed\s+successfully|successfully\s+renewed|renewal\s+successful", re.I)
+    fail_re = re.compile(r"renew(?:al)?\s+failed|failed\s+to\s+renew|not\s+renewed|error|unable|cancel(?:led|lation|ing)", re.I)
+    deadline = time.time() + timeout
+    last_candidates = []
+    while time.time() < deadline:
+        try:
+            notices = js_eval(page, r"""
+                () => {
+                    const normalize = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+                    const visible = (el) => {
+                        if (!el) return false;
+                        const st = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return st && st.display !== 'none' && st.visibility !== 'hidden'
+                            && Number(st.opacity || 1) > 0
+                            && rect.width > 0 && rect.height > 0;
+                    };
+                    const textOf = (el) => normalize(
+                        el.innerText || el.value || el.getAttribute('aria-label') ||
+                        el.getAttribute('title') || el.textContent || ''
+                    );
+                    const selectors = [
+                        '.toast', '.toast-message', '.toast-body',
+                        '.Toastify__toast', '.iziToast', '.notyf__toast',
+                        '.swal2-toast', '.swal2-popup', '.swal2-title',
+                        '.notification', '.alert', '.notify', '.message',
+                        '[role="status"]', '[role="alert"]', '[aria-live]'
+                    ];
+                    const seen = new Set();
+                    const nodes = selectors.flatMap((sel) => Array.from(document.querySelectorAll(sel)))
+                        .filter((el) => {
+                            if (seen.has(el)) return false;
+                            seen.add(el);
+                            return visible(el);
+                        })
+                        .map((el) => {
+                            const rect = el.getBoundingClientRect();
+                            const text = textOf(el);
+                            const topRightScore = (rect.top < window.innerHeight * 0.45 ? 1 : 0)
+                                + (rect.left > window.innerWidth * 0.45 ? 1 : 0);
+                            return {
+                                text,
+                                x: Math.round(rect.left),
+                                y: Math.round(rect.top),
+                                w: Math.round(rect.width),
+                                h: Math.round(rect.height),
+                                topRightScore,
+                            };
+                        })
+                        .filter((item) => item.text.length > 0)
+                        .sort((a, b) => b.topRightScore - a.topRightScore || a.y - b.y || b.x - a.x)
+                        .slice(0, 10);
+                    return nodes;
+                }
+            """) or []
+            if notices:
+                last_candidates = notices
+            for item in notices:
+                text = str(item.get("text", ""))
+                if success_re.search(text):
+                    log.info(f"✅ 已抓取右上角续期成功提示: {text}")
+                    return {"seen": True, "success": True, "text": text, "candidates": notices}
+                if fail_re.search(text):
+                    log.error(f"❌ 已抓取右上角异常提示: {text}")
+                    return {"seen": True, "success": False, "text": text, "candidates": notices}
+        except Exception:
+            pass
+        time.sleep(0.5)
+    log.warning(f"⚠️ 未在 {timeout} 秒内抓取到右上角续期结果提示。最后候选: {last_candidates}")
+    return {"seen": False, "success": False, "text": "", "candidates": last_candidates}
+
 def click_confirm_modal_if_exists(page, tag: str = "renew_confirm", timeout: int = 15, required: bool = True) -> bool:
     """点击续期后的二次确认弹窗。
 
@@ -316,10 +496,8 @@ def click_confirm_modal_if_exists(page, tag: str = "renew_confirm", timeout: int
     空格或标点稍有变化，就会静默返回 False，导致日志看起来“点击了 Renew”，
     但实际没有提交最终确认。
     """
-    role_patterns = [
-        re.compile(r"yes\s*,?\s*renew\s*it!?", re.I),
-        re.compile(r"confirm|ok|continue", re.I),
-    ]
+    role_patterns = [re.compile(r"renew", re.I)]
+    reject_pattern = re.compile(r"cancel|delete|remove|terminate|destroy|suspend|do\s*not|don't|not\s+renew|^\s*no\b", re.I)
 
     deadline = time.time() + timeout
     last_probe = None
@@ -328,6 +506,14 @@ def click_confirm_modal_if_exists(page, tag: str = "renew_confirm", timeout: int
             try:
                 btn = page.get_by_role("button", name=pattern).first
                 if btn.is_visible():
+                    btn_text = ""
+                    try:
+                        btn_text = btn.inner_text(timeout=1000) or ""
+                    except Exception:
+                        pass
+                    if reject_pattern.search(btn_text):
+                        log.warning(f"⚠️ 跳过疑似非续期确认按钮: {btn_text}")
+                        continue
                     btn.click(timeout=3000)
                     log.info(f"-> 成功通过 ARIA 模式触发二层确认按钮: /{pattern.pattern}/")
                     time.sleep(2)
@@ -363,11 +549,12 @@ def click_confirm_modal_if_exists(page, tag: str = "renew_confirm", timeout: int
                     'button, [role="button"], input[type="button"], input[type="submit"], a'
                 )).filter(visible).map((el) => ({ el, text: textOf(el), selector: 'dialog scoped button' })));
 
-                const candidates = [...directConfirm, ...scopedButtons];
+                const rejectRe = /cancel|delete|remove|terminate|destroy|suspend|do\s*not|don't|not\s+renew|^\s*no\b/i;
+                const candidates = [...directConfirm, ...scopedButtons].filter((item) =>
+                    !rejectRe.test(item.text)
+                );
                 const target = candidates.find((item) =>
-                    /yes\s*,?\s*renew\s*it!?/i.test(item.text) ||
-                    /confirm|ok|continue/i.test(item.text) ||
-                    item.selector === '.swal2-confirm'
+                    /renew/i.test(item.text)
                 );
 
                 if (target) {
@@ -401,16 +588,15 @@ def click_confirm_modal_if_exists(page, tag: str = "renew_confirm", timeout: int
         log.info(f"ℹ️ 未观察到续期二次确认按钮，当前属于近满期探测场景，交由续期后剩余时间判定。最后探测: {last_probe}")
     return False
 
-def judge_renew_result(old_days: float, new_days: float, confirm_clicked: bool) -> tuple[bool, str]:
-    if new_days > (old_days + RENEW_SUCCESS_INCREMENT_DAYS):
-        return True, "剩余时间已明显增加"
-    if old_days >= RENEW_NEAR_LIMIT_DAYS and new_days >= (old_days - RENEW_TIME_TOLERANCE_DAYS):
-        if confirm_clicked:
-            return True, "二次确认已提交；剩余时间接近 14 天上限，页面可能不会出现大于 0.5 天的增量"
-        return True, "当前剩余时间已接近 14 天上限；未观察到二次确认提交，但平台可能不会继续增加时间，按健康状态处理"
+def judge_renew_result(old_days: float, new_days: float, confirm_clicked: bool, renew_notice: dict) -> tuple[bool, str, str]:
+    notice_text = renew_notice.get("text") or ""
+    if renew_notice.get("seen") and renew_notice.get("success"):
+        return True, "续期成功", f"已抓取右上角提示: {notice_text}"
+    if renew_notice.get("seen") and not renew_notice.get("success"):
+        return False, "续期失败", f"已抓取右上角异常提示: {notice_text}"
     if not confirm_clicked:
-        return False, "二次确认按钮未点击，续期请求大概率没有提交"
-    return False, "二次确认已点击，但剩余时间未增加"
+        return False, "续期失败", "二次确认按钮未点击，且未抓取到右上角 Server renewed 提示"
+    return False, "结果未知", f"已点击续期确认，但未抓取到右上角 Server renewed 提示；时间仅供参考: {old_days:.4f} -> {new_days:.4f} 天"
 
 
 # ── 单个账号核心闭环 (已修复：采用拟人化物理按钮点击，避开 window 函数找不到的硬阻断) ──
@@ -423,6 +609,10 @@ def run_for_account(page, account: dict) -> str:
     if not servers:
         return f"⚠️ 账号 [{mask(username)}] 底座名下无任何活跃容器实例"
 
+    if page_has_cancel_state(page):
+        take_screenshot(page, f"cancel_state_detected_{safe_name(username)}")
+        return f"❌ 账号 [{mask(username)}] 检测到服务器页面存在 Cancel 状态/取消弹窗痕迹，已停止所有自动点击，请先手动恢复或联系平台支持"
+
     results = []
     for s in servers:
         target_id = s["server_id"]
@@ -431,17 +621,7 @@ def run_for_account(page, account: dict) -> str:
         
         log.info(f"⏳ 容器 [{s['name']}] 续期前解析天数: {old_days:.4f} 天 ({old_time_str})")
         
-        # 🌟 修复点 2：改用拟人化 DOM 物理点击，100% 绕过打包工具导致的全局 window.handleServerRenew 找不到问题
-        try:
-            renew_btn = page.locator(f"*[onclick*='{target_id}']").first
-            if renew_btn.is_visible():
-                renew_btn.click(timeout=5000)
-                log.info(f"-> 成功通过 DOM 物理点击触发容器 [{s['name']}] 的续期弹窗")
-            else:
-                log.warning(f"⚠️ 未找到精准 ID 按钮，尝试通过行索引 [{s['index']}] 模拟点击")
-                page.get_by_role("button", name=re.compile("Renew", re.I)).nth(s['index']).click(timeout=5000)
-        except Exception as e:
-            log.error(f"❌ 触发续期点击交互时发生异常: {e}")
+        if not click_renew_button(page, s):
             results.append({"name": s["name"], "success": False, "time_str": old_time_str, "err_msg": "点击触发失败"})
             continue
 
@@ -453,8 +633,10 @@ def run_for_account(page, account: dict) -> str:
             timeout=4 if near_limit_before else 15,
             required=not near_limit_before,
         )
+
+        renew_notice = wait_for_renew_notice(page, timeout=RENEW_NOTICE_TIMEOUT)
         
-        time.sleep(4)
+        time.sleep(2)
         navigate(page, SERVERS_URL)
         time.sleep(2)
         
@@ -477,17 +659,20 @@ def run_for_account(page, account: dict) -> str:
         new_days = parse_days_remaining(new_time_str)
         log.info(f"⏳ 容器 [{s['name']}] 续期后解析天数: {new_days:.4f} 天 ({new_time_str})")
 
-        is_real_success, renew_note = judge_renew_result(old_days, new_days, confirm_clicked)
+        is_real_success, status_label, renew_note = judge_renew_result(old_days, new_days, confirm_clicked, renew_notice)
         if is_real_success:
-            log.info(f"✅ 容器 [{s['name']}] 判定为健康/成功: {renew_note}")
+            log.info(f"✅ 容器 [{s['name']}] 判定为{status_label}: {renew_note}")
+        elif status_label == "结果未知":
+            log.warning(f"⚠️ 容器 [{s['name']}] 判定为结果未知: {renew_note}")
         elif not confirm_clicked:
-            log.error(f"❌ 容器 [{s['name']}] 未完成二次确认点击，且剩余时间未达到近满期健康阈值。")
+            log.error(f"❌ 容器 [{s['name']}] 未完成二次确认点击，且未抓取到右上角成功提示。")
         else:
-            log.error(f"❌ 容器 [{s['name']}] 二次确认已点击，但续期后状态未通过判定: {renew_note}")
+            log.error(f"❌ 容器 [{s['name']}] 续期后状态未通过右上角提示判定: {renew_note}")
 
         results.append({
             "name": s["name"],
             "success": is_real_success,
+            "status_label": status_label,
             "time_str": new_time_str,
             "note": renew_note,
         })
@@ -500,7 +685,12 @@ def run_for_account(page, account: dict) -> str:
         if r.get("err_msg"):
             suffix_items.append(r["err_msg"])
         err_suffix = f" ({'；'.join(suffix_items)})" if suffix_items else ""
-        status = "✅ 续期成功" if r["success"] else "❌ 续期失败"
+        if r["success"]:
+            status = f"✅ {r.get('status_label', '续期成功')}"
+        elif r.get("status_label") == "结果未知":
+            status = "⚠️ 结果未知"
+        else:
+            status = "❌ 续期失败"
         lines.append(f"  {status} [{r['name']}] -> 剩余到期时间: {r['time_str']}{err_suffix}")
     return "\n".join(lines)
 
