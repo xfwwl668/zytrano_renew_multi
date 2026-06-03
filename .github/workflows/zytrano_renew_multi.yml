@@ -66,8 +66,17 @@ jobs:
           RECORD_PID=$!
           sleep 2
 
-          # 运行刚刚建立的 Python 脚本，设置 270 秒软超时
-          timeout 270 python zytrano_renew_multi.py || echo "脚本退出码: $?"
+          # 运行刚刚建立的 Python 脚本，设置 270 秒软超时。
+          # 先保存退出码再清理录屏/Xvfb，最后原样退出，避免真实失败被 echo 吞掉。
+          set +e
+          timeout 270 python zytrano_renew_multi.py
+          SCRIPT_EXIT=$?
+          set -e
+          if [ "$SCRIPT_EXIT" -eq 124 ]; then
+            echo "脚本达到 270 秒软超时"
+          elif [ "$SCRIPT_EXIT" -ne 0 ]; then
+            echo "脚本退出码: $SCRIPT_EXIT"
+          fi
 
           echo "=== 截图目录 ==="
           ls -la ./screenshots/ || echo "无截图"
@@ -79,6 +88,7 @@ jobs:
           kill $XVFB_PID  2>/dev/null || true
 
           echo "录像大小: $(stat -c%s /tmp/recording.mp4 2>/dev/null || echo 0) bytes"
+          exit "$SCRIPT_EXIT"
 
       - name: 上传截图和录屏
         if: always()
