@@ -363,13 +363,35 @@ def login(page, account: dict) -> bool:
 
 
 def extract_page_clues(page) -> str:
-    text = get_text(page)
+    alert_text = js_eval(page, r"""
+        () => {
+            const normalize = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+            const visible = (el) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return st && st.display !== 'none' && st.visibility !== 'hidden'
+                    && Number(st.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+            };
+            return Array.from(document.querySelectorAll('.alert, [role="alert"], .toast, [aria-live]'))
+                .filter(visible)
+                .map((el) => normalize(el.innerText || el.textContent || ''))
+                .filter(Boolean)
+                .join(' | ');
+        }
+    """) or ""
+    text = "\n".join([str(alert_text), get_text(page)])
     lines = []
     for raw_line in text.splitlines():
         line = re.sub(r"\s+", " ", raw_line).strip()
         if not line:
             continue
-        if re.search(r"renew|expir|suspend|due|remaining|server|plan|status|active|inactive|trial|days?", line, re.I):
+        if re.search(
+            r"renew|expir|suspend|due|remaining|server|plan|status|active|inactive|trial|days?|"
+            r"can't|cannot|able\s+to|as\s+of|captcha|verified|altcha",
+            line,
+            re.I,
+        ):
             lines.append(line)
         if len(lines) >= 8:
             break
@@ -391,10 +413,88 @@ def page_has_non_due_state(page) -> bool:
     text = get_text(page)
     return bool(re.search(
         r"already\s+renewed|not\s+eligible|too\s+early|renew\s+in|can\s+renew\s+in|"
-        r"cannot\s+renew\s+yet|no\s+renewal\s+required|active\s+and\s+up\s+to\s+date",
+        r"cannot\s+renew\s+yet|can't\s+renew|can\s*not\s+renew|will\s+be\s+able|able\s+to\s+as\s+of|"
+        r"no\s+renewal\s+required|active\s+and\s+up\s+to\s+date",
         text,
         re.I,
     ))
+
+
+def wait_altcha_or_modal_captcha_ready(page, timeout: int = 35) -> tuple[bool, str]:
+    """等待 KataBump 续期弹窗内的 ALTCHA/验证码完成。
+
+    该平台会在续期二次确认弹窗中展示 ALTCHA。通常它会自动进入 Verified；
+    如果没有自动勾选，则尝试点击弹窗内的复选框，然后继续等待。
+    """
+    deadline = time.time() + timeout
+    clicked_checkbox = False
+    last_state = None
+    while time.time() < deadline:
+        state = js_eval(page, r"""
+            () => {
+                const normalize = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+                const visible = (el) => {
+                    if (!el) return false;
+                    const st = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return st && st.display !== 'none' && st.visibility !== 'hidden'
+                        && Number(st.opacity || 1) > 0 && rect.width > 0 && rect.height > 0;
+                };
+                const textOf = (el) => normalize(
+                    el.innerText || el.value || el.getAttribute('aria-label') ||
+                    el.getAttribute('title') || el.textContent || ''
+                );
+                const roots = Array.from(document.querySelectorAll(
+                    '.modal.show, .modal[aria-modal="true"], .modal[style*="display: block"], .modal-content, .modal-dialog, [role="dialog"], .swal2-popup, .offcanvas.show'
+                )).filter(visible);
+                const bodyText = textOf(document.body);
+                const root = roots.find((el) => /renew|extend|captcha|altcha|this will extend/i.test(textOf(el))) || null;
+                if (!root && !/captcha|altcha|verified/i.test(bodyText)) {
+                    return { foundCaptcha: false, verified: true, text: '' };
+                }
+
+                const scope = root || document.body;
+                const text = textOf(scope);
+                const checkbox = Array.from(scope.querySelectorAll('input[type="checkbox"]')).find(visible) || null;
+                const checked = checkbox ? Boolean(checkbox.checked) : false;
+                const verified = /\bverified\b|success|completed/i.test(text) || checked;
+                if (!verified && checkbox) {
+                    const rect = checkbox.getBoundingClientRect();
+                    return {
+                        foundCaptcha: true,
+                        verified: false,
+                        hasCheckbox: true,
+                        clickX: rect.left + rect.width / 2,
+                        clickY: rect.top + rect.height / 2,
+                        text: text.slice(0, 300),
+                    };
+                }
+                return {
+                    foundCaptcha: /captcha|altcha|verified/i.test(text),
+                    verified,
+                    hasCheckbox: Boolean(checkbox),
+                    text: text.slice(0, 300),
+                };
+            }
+        """) or {}
+        last_state = state
+
+        if state.get("verified"):
+            return True, state.get("text") or "验证码已就绪"
+
+        if state.get("hasCheckbox") and not clicked_checkbox:
+            try:
+                page.mouse.move(float(state["clickX"]), float(state["clickY"]))
+                time.sleep(random.uniform(0.2, 0.5))
+                page.mouse.click(float(state["clickX"]), float(state["clickY"]))
+                clicked_checkbox = True
+                log.info("🎯 已尝试点击 KataBump 续期弹窗内的 ALTCHA 复选框。")
+            except Exception as e:
+                log.warning(f"⚠️ ALTCHA 复选框点击失败，继续等待自动验证: {e}")
+
+        time.sleep(0.7)
+
+    return False, f"验证码未在 {timeout} 秒内完成，最后状态: {last_state}"
 
 
 def find_renew_button_probe(page) -> dict:
@@ -527,10 +627,34 @@ def click_confirm_modal_if_exists(page, timeout: int = 12) -> tuple[bool, str]:
                     el.getAttribute('title') || el.textContent || ''
                 );
                 const roots = Array.from(document.querySelectorAll(
-                    '.swal2-container, .swal2-popup, .modal.show, .modal[style*="display: block"], [role="dialog"], .offcanvas.show'
-                )).filter(visible);
+                    '.swal2-container, .swal2-popup, .modal.show, .modal[aria-modal="true"], .modal[style*="display: block"], .modal-content, .modal-dialog, [role="dialog"], .offcanvas.show'
+                )).filter(visible).filter((el) => /renew|extend|captcha|altcha|this will extend/i.test(textOf(el)));
                 if (!roots.length) {
-                    return { clicked: false, noDialog: true };
+                    const fallbackButtons = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"], a'))
+                        .filter(visible)
+                        .map((el) => {
+                            const rect = el.getBoundingClientRect();
+                            const text = textOf(el);
+                            const attrs = normalize([
+                                el.getAttribute('class'), el.getAttribute('data-bs-target'), el.getAttribute('data-target'),
+                                el.getAttribute('onclick'), el.getAttribute('formaction')
+                            ].filter(Boolean).join(' '));
+                            let z = 0;
+                            let p = el;
+                            while (p && p !== document.body) {
+                                const zi = Number.parseInt(window.getComputedStyle(p).zIndex || '0', 10);
+                                if (!Number.isNaN(zi)) z = Math.max(z, zi);
+                                p = p.parentElement;
+                            }
+                            return { el, text, attrs, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, z };
+                        })
+                        .filter((item) => /^\s*renew\s*$/i.test(item.text) && !/delete|terminate|destroy|remove|suspend|stop/i.test(`${item.text} ${item.attrs}`))
+                        .sort((a, b) => b.z - a.z || a.y - b.y);
+                    const target = fallbackButtons[0];
+                    if (!target) {
+                        return { clicked: false, noDialog: true, renewButtons: fallbackButtons.map((item) => ({ text: item.text, attrs: item.attrs, z: item.z, y: Math.round(item.y) })) };
+                    }
+                    return { clicked: false, fallbackRenew: true, text: target.text, x: target.x, y: target.y, z: target.z };
                 }
                 const rootText = normalize(roots.map(textOf).join(' '));
                 if (/delete|terminate|destroy|remove|wipe|cancel\s+server|suspend/i.test(rootText)) {
@@ -556,9 +680,27 @@ def click_confirm_modal_if_exists(page, timeout: int = 12) -> tuple[bool, str]:
             log.info(f"-> KataBump 二次确认按钮已点击: {probe.get('text')}")
             time.sleep(2)
             return True, f"已点击确认按钮: {probe.get('text')}"
+        if isinstance(probe, dict) and probe.get("fallbackRenew"):
+            captcha_ready, captcha_detail = wait_altcha_or_modal_captcha_ready(page)
+            if not captcha_ready:
+                return False, captcha_detail
+            try:
+                x, y = float(probe["x"]), float(probe["y"])
+                page.mouse.move(x, y)
+                time.sleep(random.uniform(0.2, 0.5))
+                page.mouse.click(x, y)
+                log.info(f"-> KataBump 通过弹窗兜底坐标点击最终 Renew: text='{probe.get('text')}', z={probe.get('z')}")
+                time.sleep(2)
+                return True, f"已点击弹窗最终 Renew；{captcha_detail}"
+            except Exception as e:
+                return False, f"弹窗最终 Renew 兜底点击失败: {e}"
         if isinstance(probe, dict) and probe.get("dangerDialog"):
             log.error(f"❌ 检测到危险弹窗，已拒绝确认: {probe.get('rootText')}")
             return False, "检测到危险弹窗，已拒绝点击"
+        if isinstance(probe, dict) and not probe.get("noDialog"):
+            captcha_ready, captcha_detail = wait_altcha_or_modal_captcha_ready(page)
+            if not captcha_ready:
+                return False, captcha_detail
         time.sleep(0.5)
 
     log.info(f"ℹ️ 未观察到 KataBump 二次确认弹窗，最后探测: {last_probe}")
@@ -567,7 +709,11 @@ def click_confirm_modal_if_exists(page, timeout: int = 12) -> tuple[bool, str]:
 
 def wait_for_result_notice(page, timeout: int = RESULT_NOTICE_TIMEOUT) -> dict:
     success_re = re.compile(r"renew(?:ed|al)?\s+(?:success|complete)|successfully\s+(?:renewed|extended)|server\s+renewed|extended\s+successfully", re.I)
-    skip_re = re.compile(r"already\s+renewed|too\s+early|not\s+eligible|can\s+renew\s+in|cannot\s+renew\s+yet|no\s+renewal\s+required", re.I)
+    skip_re = re.compile(
+        r"already\s+renewed|too\s+early|not\s+eligible|can\s+renew\s+in|cannot\s+renew\s+yet|"
+        r"can't\s+renew|can\s*not\s+renew|will\s+be\s+able|able\s+to\s+as\s+of|no\s+renewal\s+required",
+        re.I,
+    )
     fail_re = re.compile(r"renew(?:al)?\s+failed|failed\s+to\s+renew|error|unable|insufficient|forbidden|unauthori[sz]ed|invalid", re.I)
 
     deadline = time.time() + timeout
