@@ -131,3 +131,42 @@ Suspended in: 14 days, 0 hours, 0 minutes
 - 本项目仅用于自动化续期个人免费服务器，请勿用于其他用途。
 - Zytrano 平台规则如有变化（如页面结构调整），可能需要更新脚本中的选择器逻辑。
 - 若连续多次运行失败，请下载 Artifacts 中的截图排查具体原因。
+
+
+
+已新增：
+
+katabump_renew_multi.py：KataBump 多账号自动续期脚本。
+
+默认目标就是你给的服务器页面 303320。
+登录入口使用 LOGIN_URL。
+支持 KataBump 登录页的 Turnstile 验证处理，登录逻辑在 login()。
+续期目标执行逻辑在 renew_target()。
+支持截图、结果识别、二次确认弹窗、安全过滤危险按钮、WxPusher 异常推送。
+.github/workflows/katabump_renew_multi.yml：KataBump 独立定时运行工作流。
+
+每两天北京时间 10:30 自动跑一次，对应 cron。
+支持手动运行，对应 workflow_dispatch。
+会录屏和上传截图，方便排查，对应 artifact 配置在 .github/workflows/katabump_renew_multi.yml。
+验证结果：
+
+已执行 python -m py_compile katabump_renew_multi.py，语法检查通过。
+GitHub Secrets 配置方式：
+
+单账号最简单配置：
+
+KATABUMP_EMAIL：KataBump 邮箱账号
+KATABUMP_PASSWORD：KataBump 密码
+KATABUMP_SERVER_IDS：服务器 ID，默认可不填，因为脚本已默认 303320
+多账号配置：
+
+KATABUMP_ACCOUNTS_JSON，示例：
+[
+  {
+    "email": "your-email@example.com",
+    "password": "your-password",
+    "server_ids": ["303320"]
+  }
+]
+
+如果后面你有多个 KataBump 服务器，可以把 server_ids 改成多个 ID，或者用 KATABUMP_SERVER_IDS 写成逗号分隔。脚本会优先续期账号内配置的 server_ids / server_urls，否则使用全局变量，最后才使用默认的 30332
