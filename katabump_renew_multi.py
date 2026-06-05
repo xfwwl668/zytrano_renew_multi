@@ -428,11 +428,24 @@ def wait_altcha_or_modal_captcha_ready(page, timeout: int = 35) -> tuple[bool, s
     """
     deadline = time.time() + timeout
     clicked_checkbox = False
+    clicked_widget = False
     last_state = None
     while time.time() < deadline:
         state = js_eval(page, r"""
             () => {
                 const normalize = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+                const deepAll = (root, selector, out = []) => {
+                    try {
+                        if (root.querySelectorAll) {
+                            out.push(...Array.from(root.querySelectorAll(selector)));
+                        }
+                        const all = root.querySelectorAll ? Array.from(root.querySelectorAll('*')) : [];
+                        for (const el of all) {
+                            if (el.shadowRoot) deepAll(el.shadowRoot, selector, out);
+                        }
+                    } catch (_) {}
+                    return out;
+                };
                 const visible = (el) => {
                     if (!el) return false;
                     const st = window.getComputedStyle(el);
@@ -446,7 +459,7 @@ def wait_altcha_or_modal_captcha_ready(page, timeout: int = 35) -> tuple[bool, s
                 );
                 const roots = Array.from(document.querySelectorAll(
                     '.modal.show, .modal[aria-modal="true"], .modal[style*="display: block"], .modal-content, .modal-dialog, [role="dialog"], .swal2-popup, .offcanvas.show'
-                )).filter(visible);
+                )).filter(visible).sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
                 const bodyText = textOf(document.body);
                 const root = roots.find((el) => /renew|extend|captcha|altcha|this will extend/i.test(textOf(el))) || null;
                 if (!root && !/captcha|altcha|verified/i.test(bodyText)) {
@@ -455,11 +468,25 @@ def wait_altcha_or_modal_captcha_ready(page, timeout: int = 35) -> tuple[bool, s
 
                 const scope = root || document.body;
                 const text = textOf(scope);
-                const checkbox = Array.from(scope.querySelectorAll('input[type="checkbox"]')).find(visible) || null;
-                const checked = checkbox ? Boolean(checkbox.checked) : false;
+                const checkboxes = deepAll(scope, 'input[type="checkbox"], [role="checkbox"]')
+                    .filter(visible)
+                    .map((el) => {
+                        const rect = el.getBoundingClientRect();
+                        const checked = Boolean(el.checked)
+                            || /true|checked/i.test(String(el.getAttribute('aria-checked') || ''))
+                            || /checked|verified/i.test(String(el.className || ''));
+                        return { el, checked, rect };
+                    })
+                    .sort((a, b) => a.rect.left - b.rect.left || a.rect.top - b.rect.top);
+                const checkbox = checkboxes[0] || null;
+                const widget = deepAll(scope, 'altcha-widget, .altcha, [class*="altcha"], [data-altcha], iframe, label')
+                    .filter(visible)
+                    .map((el) => ({ el, rect: el.getBoundingClientRect(), text: textOf(el) }))
+                    .sort((a, b) => (b.rect.width * b.rect.height) - (a.rect.width * a.rect.height))[0] || null;
+                const checked = checkbox ? checkbox.checked : false;
                 const verified = /\bverified\b|success|completed/i.test(text) || checked;
                 if (!verified && checkbox) {
-                    const rect = checkbox.getBoundingClientRect();
+                    const rect = checkbox.rect;
                     return {
                         foundCaptcha: true,
                         verified: false,
@@ -469,10 +496,21 @@ def wait_altcha_or_modal_captcha_ready(page, timeout: int = 35) -> tuple[bool, s
                         text: text.slice(0, 300),
                     };
                 }
+                if (!verified && widget) {
+                    return {
+                        foundCaptcha: true,
+                        verified: false,
+                        hasWidget: true,
+                        clickX: widget.rect.left + Math.min(28, widget.rect.width / 2),
+                        clickY: widget.rect.top + widget.rect.height / 2,
+                        text: text.slice(0, 300),
+                    };
+                }
                 return {
                     foundCaptcha: /captcha|altcha|verified/i.test(text),
                     verified,
                     hasCheckbox: Boolean(checkbox),
+                    hasWidget: Boolean(widget),
                     text: text.slice(0, 300),
                 };
             }
@@ -491,6 +529,16 @@ def wait_altcha_or_modal_captcha_ready(page, timeout: int = 35) -> tuple[bool, s
                 log.info("🎯 已尝试点击 KataBump 续期弹窗内的 ALTCHA 复选框。")
             except Exception as e:
                 log.warning(f"⚠️ ALTCHA 复选框点击失败，继续等待自动验证: {e}")
+
+        if state.get("hasWidget") and not clicked_widget:
+            try:
+                page.mouse.move(float(state["clickX"]), float(state["clickY"]))
+                time.sleep(random.uniform(0.2, 0.5))
+                page.mouse.click(float(state["clickX"]), float(state["clickY"]))
+                clicked_widget = True
+                log.info("🎯 已尝试点击 KataBump 续期弹窗内的 ALTCHA 组件区域。")
+            except Exception as e:
+                log.warning(f"⚠️ ALTCHA 组件区域点击失败，继续等待自动验证: {e}")
 
         time.sleep(0.7)
 
@@ -628,7 +676,13 @@ def click_confirm_modal_if_exists(page, timeout: int = 12) -> tuple[bool, str]:
                 );
                 const roots = Array.from(document.querySelectorAll(
                     '.swal2-container, .swal2-popup, .modal.show, .modal[aria-modal="true"], .modal[style*="display: block"], .modal-content, .modal-dialog, [role="dialog"], .offcanvas.show'
-                )).filter(visible).filter((el) => /renew|extend|captcha|altcha|this will extend/i.test(textOf(el)));
+                )).filter(visible)
+                    .filter((el) => /renew|extend|captcha|altcha|this will extend/i.test(textOf(el)))
+                    .sort((a, b) => {
+                        const ar = a.getBoundingClientRect();
+                        const br = b.getBoundingClientRect();
+                        return (br.width * br.height) - (ar.width * ar.height);
+                    });
                 if (!roots.length) {
                     const fallbackButtons = Array.from(document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"], a'))
                         .filter(visible)
@@ -660,19 +714,27 @@ def click_confirm_modal_if_exists(page, timeout: int = 12) -> tuple[bool, str]:
                 if (/delete|terminate|destroy|remove|wipe|cancel\s+server|suspend/i.test(rootText)) {
                     return { clicked: false, dangerDialog: true, rootText: rootText.slice(0, 300) };
                 }
-                const buttons = roots.flatMap((root) => Array.from(root.querySelectorAll(
+                const root = roots[0];
+                const buttons = Array.from(root.querySelectorAll(
                     'button, [role="button"], input[type="button"], input[type="submit"], a, .swal2-confirm'
-                ))).filter(visible).map((el) => ({ el, text: textOf(el) }));
+                )).filter(visible).map((el) => {
+                    const rect = el.getBoundingClientRect();
+                    return {
+                        el,
+                        text: textOf(el),
+                        attrs: normalize([el.getAttribute('class'), el.getAttribute('onclick'), el.getAttribute('formaction')].filter(Boolean).join(' ')),
+                        x: rect.left + rect.width / 2,
+                        y: rect.top + rect.height / 2,
+                    };
+                });
                 const rejectRe = /cancel|close|no|back|delete|terminate|destroy|remove|suspend|stop/i;
-                const target = buttons.find((item) =>
-                    /renew|extend|confirm|yes|continue|proceed|ok|okay/i.test(item.text) && !rejectRe.test(item.text)
-                );
+                const target = buttons.find((item) => /^\s*renew\s*$/i.test(item.text) && !rejectRe.test(`${item.text} ${item.attrs}`))
+                    || buttons.find((item) => /renew|extend|confirm|yes|continue|proceed|ok|okay/i.test(item.text) && !rejectRe.test(`${item.text} ${item.attrs}`));
                 if (!target) {
                     return { clicked: false, rootText: rootText.slice(0, 300), buttons: buttons.map((item) => item.text).slice(0, 10) };
                 }
                 target.el.scrollIntoView({ block: 'center', inline: 'center' });
-                target.el.click();
-                return { clicked: true, text: target.text, rootText: rootText.slice(0, 300) };
+                return { clicked: false, modalRenew: true, text: target.text, x: target.x, y: target.y, rootText: rootText.slice(0, 300), buttons: buttons.map((item) => item.text).slice(0, 10) };
             }
         """)
         last_probe = probe
@@ -680,6 +742,25 @@ def click_confirm_modal_if_exists(page, timeout: int = 12) -> tuple[bool, str]:
             log.info(f"-> KataBump 二次确认按钮已点击: {probe.get('text')}")
             time.sleep(2)
             return True, f"已点击确认按钮: {probe.get('text')}"
+        if isinstance(probe, dict) and probe.get("modalRenew"):
+            captcha_ready, captcha_detail = wait_altcha_or_modal_captcha_ready(page, timeout=45)
+            if not captcha_ready:
+                take_screenshot(page, "katabump_modal_altcha_not_ready")
+                return False, captcha_detail
+            try:
+                x, y = float(probe["x"]), float(probe["y"])
+                page.mouse.move(x, y)
+                time.sleep(random.uniform(0.25, 0.55))
+                page.mouse.click(x, y)
+                log.info(
+                    f"-> KataBump 已物理点击续期弹窗内第二个 Renew: "
+                    f"text='{probe.get('text')}', buttons={probe.get('buttons')}"
+                )
+                time.sleep(2)
+                return True, f"已完成弹窗验证码并点击第二个 Renew；{captcha_detail}"
+            except Exception as e:
+                take_screenshot(page, "katabump_modal_second_renew_click_failed")
+                return False, f"弹窗第二个 Renew 点击失败: {e}"
         if isinstance(probe, dict) and probe.get("fallbackRenew"):
             captcha_ready, captcha_detail = wait_altcha_or_modal_captcha_ready(page)
             if not captcha_ready:
