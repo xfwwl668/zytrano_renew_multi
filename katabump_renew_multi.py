@@ -202,49 +202,214 @@ def js_eval(page, script: str, *args):
         return None
 
 
+def ensure_viewport(page, width: int = 1280, height: int = 800) -> bool:
+    """确保页面 viewport 已正确初始化，避免 'Viewport size not available' 错误。"""
+    try:
+        vp = page.viewport_size
+        if vp and vp.get("width") and vp.get("height"):
+            return True
+        page.set_viewport_size({"width": width, "height": height})
+        time.sleep(0.3)
+        return True
+    except Exception as e:
+        log.warning(f"⚠️ KataBump viewport 初始化异常: {e}")
+        try:
+            page.set_viewport_size({"width": width, "height": height})
+            return True
+        except Exception:
+            return False
+
+
 def is_cf_blocked(page) -> bool:
-    body = get_text(page).lower()
-    return "verify you are human" in body or ("cloudflare" in body and "security" in body)
+    """检测当前页面是否被 Cloudflare 拦截（含 URL + 文本双重检测）。"""
+    try:
+        url = (page.url or "").lower()
+        # CF 挑战页面会跳转到这些路径
+        if any(p in url for p in ("/cdn-cgi/challenge-platform/", "/cdn-cgi/", "challenges.cloudflare.com")):
+            return True
+        body = get_text(page).lower()
+        if "verify you are human" in body:
+            return True
+        if "cloudflare" in body and any(k in body for k in ("security check", "security challenge", "checking your browser")):
+            return True
+        if "just a moment" in body and "cloudflare" in body:
+            return True
+        return False
+    except Exception:
+        return False
 
 
 def wait_cf_pass(page, timeout=45) -> bool:
+    """等待 CF 拦截解除，每秒检测一次，解除后额外等待页面稳定。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if not is_cf_blocked(page):
-            return True
+            # 额外等待 0.8s 让页面 JS 完成渲染
+            time.sleep(0.8)
+            if not is_cf_blocked(page):
+                return True
         time.sleep(1)
     return False
 
 
 def navigate(page, url: str, timeout=45) -> bool:
+    """导航到目标 URL，自动处理 CF 拦截、重载和超时。"""
+    ensure_viewport(page)
     try:
         page.goto(url, timeout=30000, wait_until="domcontentloaded")
     except Exception:
         pass
-    if not is_cf_blocked(page):
-        return True
-    if wait_cf_pass(page, timeout=timeout):
-        return True
+    # 等待页面稳定
     try:
-        page.reload(wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_load_state("domcontentloaded", timeout=5000)
     except Exception:
         pass
-    return wait_cf_pass(page, timeout=30)
+    if not is_cf_blocked(page):
+        return True
+    log.info(f"🛡️ KataBump 检测到 CF 拦截，等待通过（最多 {timeout}s）...")
+    if wait_cf_pass(page, timeout=timeout):
+        return True
+    # 第一次 reload 重试
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+        time.sleep(1)
+    except Exception:
+        pass
+    if wait_cf_pass(page, timeout=30):
+        return True
+    # 第二次 reload 重试（等待更长）
+    log.warning("⚠️ KataBump CF 拦截持续，二次 reload 重试...")
+    take_screenshot(page, "katabump_cf_stuck")
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2)
+    except Exception:
+        pass
+    return wait_cf_pass(page, timeout=20)
 
 
 def has_turnstile(page) -> bool:
+    """检测页面是否存在 CF Turnstile 组件。"""
     marker = js_eval(page, """
         () => Boolean(
             document.querySelector('.cf-turnstile') ||
             document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
-            document.querySelector('input[name="cf-turnstile-response"]')
+            document.querySelector('input[name="cf-turnstile-response"]') ||
+            document.querySelector('[data-sitekey]')
         )
     """)
     return bool(marker)
 
 
-def click_turnstile_checkbox(page, timeout=35) -> bool:
+def _safe_bounding_box(locator_or_element, retries: int = 5, interval: float = 0.6):
+    """安全获取元素 bounding_box，带重试，避免 viewport 未就绪时崩溃。"""
+    for i in range(retries):
+        try:
+            box = locator_or_element.bounding_box()
+            if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                return box
+        except Exception as e:
+            if i == retries - 1:
+                log.warning(f"⚠️ bounding_box 获取失败（已重试 {retries} 次）: {e}")
+        time.sleep(interval)
+    return None
+
+
+def _clamp_coords(x: float, y: float, vp: dict) -> tuple[float, float]:
+    """将坐标限制在 viewport 范围内，防止 out-of-bounds 点击。"""
+    margin = 5
+    x = max(margin, min(x, vp.get("width", 1280) - margin))
+    y = max(margin, min(y, vp.get("height", 800) - margin))
+    return x, y
+
+
+def _try_click_turnstile_frame(page, cf_frame) -> bool:
+    """
+    精确点击 Turnstile iframe 内的 checkbox。
+    策略优先级：
+      1. 在 frame 内用 locator 定位 input[type=checkbox] 直接 click（最准确）
+      2. 在 frame 内用 label 点击（部分实现用 label 包裹）
+      3. frame_element bounding_box 坐标点击（fallback）
+    """
+    vp = page.viewport_size or {"width": 1280, "height": 800}
+
+    # 策略 1：在 iframe 内部直接定位 checkbox
+    if cf_frame:
+        for sel in ['input[type="checkbox"]', 'label', '[role="checkbox"]']:
+            try:
+                inner = cf_frame.locator(sel).first
+                inner.wait_for(state="visible", timeout=3000)
+                inner.click(timeout=3000)
+                log.info(f"🎯 KataBump Turnstile 内部精确点击: {sel}")
+                return True
+            except Exception:
+                continue
+
+    # 策略 2：frame_element bounding_box 坐标点击
+    try:
+        if cf_frame:
+            frame_el = cf_frame.frame_element()
+            box = _safe_bounding_box(frame_el)
+        else:
+            iframe_locator = page.locator('iframe[src*="challenges.cloudflare.com"]').first
+            box = _safe_bounding_box(iframe_locator)
+
+        if box:
+            # Turnstile checkbox 约在 iframe 左侧 25px、垂直居中位置
+            x = box["x"] + min(28, box["width"] * 0.18)
+            y = box["y"] + box["height"] / 2
+            x, y = _clamp_coords(x, y, vp)
+            # 模拟人类移动轨迹：先移动到附近，再移到目标
+            page.mouse.move(x + random.uniform(-10, 10), y + random.uniform(-8, 8))
+            time.sleep(random.uniform(0.15, 0.35))
+            page.mouse.move(x, y)
+            time.sleep(random.uniform(0.2, 0.5))
+            page.mouse.click(x, y)
+            log.info(f"🎯 KataBump Turnstile 坐标点击: ({x:.0f}, {y:.0f})")
+            return True
+    except Exception as e:
+        log.warning(f"⚠️ KataBump Turnstile 坐标点击失败: {e}")
+
+    # 策略 3：JS 事件注入（最后手段，不依赖坐标）
+    js_eval(page, """
+        () => {
+            const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            if (!iframe) return;
+            const rect = iframe.getBoundingClientRect();
+            const cx = rect.left + Math.min(28, rect.width * 0.18);
+            const cy = rect.top + rect.height / 2;
+            ['mousemove','mousedown','mouseup','click'].forEach(type => {
+                iframe.dispatchEvent(new MouseEvent(type, {
+                    bubbles: true, cancelable: true, view: window,
+                    clientX: cx, clientY: cy
+                }));
+            });
+        }
+    """)
+    log.info("🎯 KataBump Turnstile JS 事件注入完成。")
+    return False  # 返回 False 表示不确定是否成功，继续等待 token
+
+
+def click_turnstile_checkbox(page, timeout=50) -> bool:
+    """
+    CF Turnstile 全流程处理器（深度优化版）。
+    流程：
+      1. 确保 viewport 就绪
+      2. 等待 Turnstile 组件出现（最多 3s）
+      3. 等待 CF iframe 加载完成（最多 12s）
+      4. 多策略点击 checkbox
+      5. 等待 token 就绪（最多 timeout 秒）
+      6. 若 token 未就绪，补救重点击，再等 15s
+    """
+    ensure_viewport(page)
+
+    # 等待 turnstile 组件出现（最多 3s）
+    for _ in range(6):
+        if has_turnstile(page):
+            break
+        time.sleep(0.5)
     if not has_turnstile(page):
+        log.info("ℹ️ KataBump 页面无 Turnstile 组件，直接通过。")
         return True
 
     def token_ready() -> bool:
@@ -267,13 +432,22 @@ def click_turnstile_checkbox(page, timeout=35) -> bool:
         """)
         return bool(val)
 
-    for _ in range(20):
-        if token_ready():
-            return True
-        time.sleep(0.5)
+    def token_value() -> str:
+        val = js_eval(page, """
+            (() => {
+                const el = document.querySelector('input[name="cf-turnstile-response"]');
+                return el ? (el.value || '') : '';
+            })()
+        """)
+        return str(val or "")
 
+    # 等待 CF iframe 加载，最多 12 秒
     cf_frame = None
-    for _ in range(20):
+    for _ in range(24):
+        # 同时检查 token（有时 CloakBrowser 直接完成，无需等 iframe）
+        if token_ready():
+            log.info("✅ KataBump Turnstile token 已自动完成，无需点击。")
+            return True
         for frame in page.frames:
             if "challenges.cloudflare.com" in (frame.url or ""):
                 cf_frame = frame
@@ -282,28 +456,39 @@ def click_turnstile_checkbox(page, timeout=35) -> bool:
             break
         time.sleep(0.5)
 
-    try:
-        if cf_frame:
-            frame_el = cf_frame.frame_element()
-            box = frame_el.bounding_box()
-        else:
-            iframe_el = page.locator('iframe[src*="challenges.cloudflare.com"]').first
-            box = iframe_el.bounding_box()
-        if box:
-            x, y = box["x"] + 25, box["y"] + (box["height"] / 2)
-            page.mouse.move(x, y)
-            time.sleep(random.uniform(0.2, 0.5))
-            page.mouse.click(x, y)
-            log.info(f"🎯 已尝试触发 KataBump Turnstile: ({x:.0f}, {y:.0f})")
-    except Exception as e:
-        log.error(f"❌ KataBump Turnstile 点击失败: {e}")
-        return False
+    if not cf_frame:
+        log.warning("⚠️ KataBump CF iframe 未找到，将尝试 locator 降级点击。")
 
+    # 第一次点击
+    _try_click_turnstile_frame(page, cf_frame)
+
+    # 等待 token，最多 timeout 秒；每 3s 检查一次是否需要重点击
     deadline = time.time() + timeout
+    last_retry_at = time.time()
+    retry_interval = 12  # 每 12 秒没有 token 就再点一次
+    click_count = 1
+
     while time.time() < deadline:
         if token_ready():
+            tv = token_value()
+            log.info(f"✅ KataBump Turnstile token 验证通过（token 长度={len(tv)}）。")
             return True
+        # 定期重点击（最多补点 2 次）
+        if click_count < 3 and (time.time() - last_retry_at) >= retry_interval:
+            log.info(f"🔄 KataBump Turnstile 补救重点击（第 {click_count + 1} 次）...")
+            # 刷新 cf_frame 引用（iframe 可能重新加载）
+            cf_frame = None
+            for frame in page.frames:
+                if "challenges.cloudflare.com" in (frame.url or ""):
+                    cf_frame = frame
+                    break
+            _try_click_turnstile_frame(page, cf_frame)
+            last_retry_at = time.time()
+            click_count += 1
         time.sleep(0.5)
+
+    log.error(f"❌ KataBump Turnstile 在 {timeout}s 内未完成验证（已点击 {click_count} 次）。")
+    take_screenshot(page, "katabump_turnstile_failed")
     return False
 
 
@@ -323,43 +508,125 @@ def is_logged_in_page(page) -> bool:
 
 def login(page, account: dict) -> bool:
     email, password = account["email"], account["password"]
-    for attempt in range(1, 3):
+    # 登录前先确保 viewport 就绪
+    ensure_viewport(page)
+
+    for attempt in range(1, 4):  # 增加到 3 次重试
         if is_logged_in_page(page):
             return True
+        log.info(f"🔐 KataBump 登录尝试 ({attempt}/3): {mask(email)}")
         if not navigate(page, LOGIN_URL):
+            log.warning(f"⚠️ KataBump 导航到登录页失败（{attempt}/3），CF 拦截未解除")
             continue
 
+        # navigate 完成后再次确保 viewport
+        ensure_viewport(page)
+
+        if is_logged_in_page(page):
+            return True
+
         try:
-            page.wait_for_selector('input[name="email"], input[type="email"]', timeout=10000)
+            # 等待输入框出现，扩大选择器范围
+            try:
+                page.wait_for_selector(
+                    'input[name="email"], input[type="email"], input[placeholder*="email" i], input[placeholder*="Email"]',
+                    timeout=12000,
+                )
+            except Exception:
+                # 降级等待任意可见输入框
+                page.wait_for_selector('input[type="text"], input[type="email"]', timeout=8000)
+
             human_delay()
-            page.locator('input[name="email"], input[type="email"]').first.fill(email)
+
+            # 填写 email（多种选择器容错）
+            filled_email = False
+            for sel in [
+                'input[name="email"]',
+                'input[type="email"]',
+                'input[placeholder*="email" i]',
+                'input[placeholder*="Email"]',
+            ]:
+                try:
+                    locator = page.locator(sel).first
+                    if locator.is_visible():
+                        locator.fill(email)
+                        filled_email = True
+                        break
+                except Exception:
+                    continue
+            if not filled_email:
+                page.locator('input[type="text"], input').first.fill(email)
+
             human_delay(0.2, 0.6)
-            page.locator('input[name="password"], input[type="password"]').first.fill(password)
+
+            # 填写 password
+            filled_pwd = False
+            for sel in ['input[name="password"]', 'input[type="password"]', 'input[placeholder*="password" i]']:
+                try:
+                    locator = page.locator(sel).first
+                    if locator.is_visible():
+                        locator.fill(password)
+                        filled_pwd = True
+                        break
+                except Exception:
+                    continue
+            if not filled_pwd:
+                page.locator('input[type="password"]').first.fill(password)
+
             human_delay(0.3, 0.8)
 
+            # 处理 Turnstile
             if not click_turnstile_checkbox(page):
-                log.error(f"❌ [账号: {mask(email)}] Turnstile 未通过，跳过本轮提交。")
-                take_screenshot(page, f"login_turnstile_failed_{email}")
+                log.error(f"❌ [账号: {mask(email)}] Turnstile 未通过（{attempt}/3），跳过本轮提交。")
+                take_screenshot(page, f"login_turnstile_failed_{email}_{attempt}")
                 continue
 
             human_delay(0.4, 0.9)
-            try:
-                page.get_by_role("button", name=re.compile(r"^\s*login\s*$", re.I)).click(timeout=3000)
-            except Exception:
-                page.locator('#submit, button[type="submit"], input[type="submit"]').first.click(timeout=3000)
 
-            deadline = time.time() + 25
+            # 点击登录按钮
+            submit_clicked = False
+            for btn_try in [
+                lambda: page.get_by_role("button", name=re.compile(r"^\s*login\s*$", re.I)).click(timeout=3000),
+                lambda: page.locator('button[type="submit"]').first.click(timeout=3000),
+                lambda: page.locator('input[type="submit"]').first.click(timeout=3000),
+                lambda: page.locator('#submit').first.click(timeout=3000),
+                lambda: page.locator('button').filter(has_text=re.compile(r"login", re.I)).first.click(timeout=3000),
+            ]:
+                try:
+                    btn_try()
+                    submit_clicked = True
+                    break
+                except Exception:
+                    continue
+
+            if not submit_clicked:
+                log.warning(f"⚠️ 登录按钮点击均失败（{attempt}/3），按 Enter 提交...")
+                try:
+                    page.locator('input[type="password"]').first.press("Enter")
+                except Exception:
+                    pass
+
+            # 等待登录结果
+            deadline = time.time() + 30
             while time.time() < deadline:
                 if is_logged_in_page(page):
+                    log.info(f"✅ KataBump 登录成功: {mask(email)}")
                     return True
                 if is_login_page(page) and re.search(r"invalid|incorrect|failed|error", get_text(page), re.I):
+                    log.warning(f"⚠️ 页面显示凭证错误（{attempt}/3）")
                     break
                 time.sleep(0.7)
+
             take_screenshot(page, f"login_not_finished_{email}_{attempt}")
+
         except Exception as ex:
-            log.warning(f"KataBump 登录重试序列异常（{attempt}/2）: {ex}")
+            log.warning(f"KataBump 登录重试序列异常（{attempt}/3）: {ex}")
             if is_logged_in_page(page):
                 return True
+
+        if attempt < 3:
+            time.sleep(random.uniform(2.0, 4.0))
+
     return False
 
 
@@ -874,7 +1141,12 @@ def wait_for_result_notice(page, timeout: int = RESULT_NOTICE_TIMEOUT) -> dict:
         r"can't\s+renew|can\s*not\s+renew|will\s+be\s+able|able\s+to\s+as\s+of|no\s+renewal\s+required",
         re.I,
     )
-    fail_re = re.compile(r"renew(?:al)?\s+failed|failed\s+to\s+renew|error|unable|insufficient|forbidden|unauthori[sz]ed|invalid", re.I)
+    # 注意：不使用裸词 "error"/"unable"，避免误匹配页面无关内容（如广告加载错误、日志字段）
+    fail_re = re.compile(
+        r"renew(?:al)?\s+failed|failed\s+to\s+renew|renew(?:al)?\s+error|unable\s+to\s+renew"
+        r"|insufficient\s+(?:credit|fund|balance|permission)|forbidden|unauthori[sz]ed|invalid\s+(?:token|session|request)",
+        re.I,
+    )
 
     deadline = time.time() + timeout
     last_candidates = []

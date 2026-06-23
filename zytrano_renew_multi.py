@@ -134,32 +134,201 @@ def parse_days_remaining(suspended_in: str) -> float:
 
 
 # ── Cloudflare 拦截层与 Turnstile 原生穿透 ──────────────────
-def is_cf_blocked(page) -> bool:
+def ensure_viewport(page, width: int = 1280, height: int = 800) -> bool:
+    """确保页面 viewport 已正确初始化，避免 'Viewport size not available' 错误。"""
     try:
+        vp = page.viewport_size
+        if vp and vp.get("width") and vp.get("height"):
+            return True
+        page.set_viewport_size({"width": width, "height": height})
+        time.sleep(0.3)
+        return True
+    except Exception as e:
+        log.warning(f"⚠️ Zytrano viewport 初始化异常: {e}")
+        try:
+            page.set_viewport_size({"width": width, "height": height})
+            return True
+        except Exception:
+            return False
+
+def is_cf_blocked(page) -> bool:
+    """检测当前页面是否被 Cloudflare 拦截（含 URL + 文本双重检测）。"""
+    try:
+        url = (page.url or "").lower()
+        if any(p in url for p in ("/cdn-cgi/challenge-platform/", "/cdn-cgi/", "challenges.cloudflare.com")):
+            return True
         body = get_text(page).lower()
-        return "verify you are human" in body or ("cloudflare" in body and "security" in body)
+        if "verify you are human" in body:
+            return True
+        if "cloudflare" in body and any(k in body for k in ("security check", "security challenge", "checking your browser")):
+            return True
+        if "just a moment" in body and "cloudflare" in body:
+            return True
+        return False
     except Exception:
         return False
 
 def wait_cf_pass(page, timeout=45) -> bool:
-    for i in range(timeout):
+    """等待 CF 拦截解除，解除后额外等待页面稳定。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         if not is_cf_blocked(page):
-            return True
+            time.sleep(0.8)
+            if not is_cf_blocked(page):
+                return True
         time.sleep(1)
     return False
 
+def _safe_bounding_box(locator_or_element, retries: int = 5, interval: float = 0.6):
+    """安全获取元素 bounding_box，带重试，避免 viewport 未就绪时崩溃。"""
+    for i in range(retries):
+        try:
+            box = locator_or_element.bounding_box()
+            if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                return box
+        except Exception as e:
+            if i == retries - 1:
+                log.warning(f"⚠️ bounding_box 获取失败（已重试 {retries} 次）: {e}")
+        time.sleep(interval)
+    return None
+
+def _clamp_coords(x: float, y: float, vp: dict) -> tuple:
+    """将坐标限制在 viewport 范围内，防止 out-of-bounds 点击。"""
+    margin = 5
+    x = max(margin, min(x, vp.get("width", 1280) - margin))
+    y = max(margin, min(y, vp.get("height", 800) - margin))
+    return x, y
+
 def navigate(page, url: str, timeout=45) -> bool:
-    try: page.goto(url, timeout=30000, wait_until="domcontentloaded")
-    except Exception: pass
+    """导航到目标 URL，自动处理 CF 拦截、重载和超时。"""
+    ensure_viewport(page)
+    try:
+        page.goto(url, timeout=30000, wait_until="domcontentloaded")
+    except Exception:
+        pass
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=5000)
+    except Exception:
+        pass
 
-    if not is_cf_blocked(page): return True
-    if wait_cf_pass(page, timeout=timeout): return True
+    if not is_cf_blocked(page):
+        return True
+    log.info(f"🛡️ Zytrano 检测到 CF 拦截，等待通过（最多 {timeout}s）...")
+    if wait_cf_pass(page, timeout=timeout):
+        return True
 
-    try: page.reload(wait_until="domcontentloaded", timeout=30000)
-    except Exception: pass
-    return wait_cf_pass(page, timeout=30)
+    # 第一次 reload
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+        time.sleep(1)
+    except Exception:
+        pass
+    if wait_cf_pass(page, timeout=30):
+        return True
 
-def click_turnstile_checkbox(page, timeout=30) -> bool:
+    # 第二次 reload（记录截图）
+    log.warning("⚠️ Zytrano CF 拦截持续，二次 reload 重试...")
+    take_screenshot(page, "zytrano_cf_stuck")
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+        time.sleep(2)
+    except Exception:
+        pass
+    return wait_cf_pass(page, timeout=20)
+
+def _try_click_turnstile_frame(page, cf_frame) -> bool:
+    """
+    精确点击 Turnstile iframe 内的 checkbox。
+    策略优先级：
+      1. 在 frame 内用 locator 定位 input[type=checkbox] 直接 click（最准确）
+      2. 在 frame 内用 label 点击
+      3. frame_element bounding_box 坐标点击（fallback）
+      4. JS 事件注入（最后手段）
+    """
+    vp = page.viewport_size or {"width": 1280, "height": 800}
+
+    # 策略 1：在 iframe 内部直接定位 checkbox/label
+    if cf_frame:
+        for sel in ['input[type="checkbox"]', 'label', '[role="checkbox"]']:
+            try:
+                inner = cf_frame.locator(sel).first
+                inner.wait_for(state="visible", timeout=3000)
+                inner.click(timeout=3000)
+                log.info(f"🎯 Zytrano Turnstile 内部精确点击: {sel}")
+                return True
+            except Exception:
+                continue
+
+    # 策略 2：frame_element bounding_box 坐标点击
+    try:
+        if cf_frame:
+            frame_el = cf_frame.frame_element()
+            box = _safe_bounding_box(frame_el)
+        else:
+            iframe_locator = page.locator('iframe[src*="challenges.cloudflare.com"]').first
+            box = _safe_bounding_box(iframe_locator)
+
+        if box:
+            x = box["x"] + min(28, box["width"] * 0.18)
+            y = box["y"] + box["height"] / 2
+            x, y = _clamp_coords(x, y, vp)
+            page.mouse.move(x + random.uniform(-10, 10), y + random.uniform(-8, 8))
+            time.sleep(random.uniform(0.15, 0.35))
+            page.mouse.move(x, y)
+            time.sleep(random.uniform(0.2, 0.5))
+            page.mouse.click(x, y)
+            log.info(f"🎯 Zytrano Turnstile 坐标点击: ({x:.0f}, {y:.0f})")
+            return True
+    except Exception as e:
+        log.warning(f"⚠️ Zytrano Turnstile 坐标点击失败: {e}")
+
+    # 策略 3：JS 事件注入
+    js_eval(page, """
+        () => {
+            const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+            if (!iframe) return;
+            const rect = iframe.getBoundingClientRect();
+            const cx = rect.left + Math.min(28, rect.width * 0.18);
+            const cy = rect.top + rect.height / 2;
+            ['mousemove','mousedown','mouseup','click'].forEach(type => {
+                iframe.dispatchEvent(new MouseEvent(type, {
+                    bubbles: true, cancelable: true, view: window,
+                    clientX: cx, clientY: cy
+                }));
+            });
+        }
+    """)
+    log.info("🎯 Zytrano Turnstile JS 事件注入完成。")
+    return False
+
+def click_turnstile_checkbox(page, timeout=50) -> bool:
+    """
+    CF Turnstile 全流程处理器（深度优化版）。
+    流程：
+      1. 确保 viewport 就绪
+      2. 等待 Turnstile 组件出现（最多 3s）
+      3. 等待 CF iframe 加载完成（最多 12s），同时检测 token 自动完成
+      4. 多策略点击 checkbox
+      5. 等待 token 就绪（最多 timeout 秒），每 12s 补救重点击（最多 2 次）
+    """
+    ensure_viewport(page)
+
+    # 等待 turnstile 组件出现（最多 3s）
+    for _ in range(6):
+        if js_eval(page, """
+            () => Boolean(
+                document.querySelector('.cf-turnstile') ||
+                document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
+                document.querySelector('input[name="cf-turnstile-response"]') ||
+                document.querySelector('[data-sitekey]')
+            )
+        """):
+            break
+        time.sleep(0.5)
+    else:
+        log.info("ℹ️ Zytrano 页面无 Turnstile 组件，直接通过。")
+        return True
+
     def token_ready() -> bool:
         val = js_eval(page, """
             (() => {
@@ -180,53 +349,50 @@ def click_turnstile_checkbox(page, timeout=30) -> bool:
         """)
         return bool(val)
 
-    for i in range(20):
-        if token_ready():
-            return True
-        time.sleep(0.5)
-
+    # 等待 CF iframe 加载，最多 12 秒，同时检测 token 自动完成
     cf_frame = None
-    for tick in range(16):
+    for _ in range(24):
+        if token_ready():
+            log.info("✅ Zytrano Turnstile token 已自动完成，无需点击。")
+            return True
         for f in page.frames:
             if "challenges.cloudflare.com" in (f.url or ""):
                 cf_frame = f
                 break
-        if cf_frame: break
+        if cf_frame:
+            break
         time.sleep(0.5)
 
     if not cf_frame:
-        try:
-            iframe_el = page.locator('iframe[src*="challenges.cloudflare.com"]').first
-            box = iframe_el.bounding_box()
-            if box:
-                x, y = box["x"] + 25, box["y"] + (box["height"] / 2)
-                page.mouse.move(x, y)
-                time.sleep(0.3)
-                page.mouse.click(x, y)
-                log.info(f"🎯 触发坐标降级点击: ({x:.0f}, {y:.0f})")
-        except Exception as e:
-            log.error(f"❌ 坐标降级点击失败: {e}")
-            return False
-    else:
-        try:
-            frame_el = cf_frame.frame_element()
-            box = frame_el.bounding_box()
-            if box:
-                x, y = box["x"] + 25, box["y"] + (box["height"] / 2)
-                page.mouse.move(x, y)
-                time.sleep(random.uniform(0.2, 0.4))
-                page.mouse.click(x, y)
-                log.info(f"🎯 核心内框坐标击发成功: ({x:.0f}, {y:.0f})")
-            else:
-                return False
-        except Exception as e:
-            log.error(f"❌ 内框物理映射异常: {e}")
-            return False
+        log.warning("⚠️ Zytrano CF iframe 未找到，将尝试 locator 降级点击。")
 
-    for i in range(timeout * 2):
+    # 第一次点击
+    _try_click_turnstile_frame(page, cf_frame)
+
+    # 等待 token，每 12s 补救重点击（最多补 2 次）
+    deadline = time.time() + timeout
+    last_retry_at = time.time()
+    retry_interval = 12
+    click_count = 1
+
+    while time.time() < deadline:
         if token_ready():
+            log.info("✅ Zytrano Turnstile token 验证通过。")
             return True
+        if click_count < 3 and (time.time() - last_retry_at) >= retry_interval:
+            log.info(f"🔄 Zytrano Turnstile 补救重点击（第 {click_count + 1} 次）...")
+            cf_frame = None
+            for f in page.frames:
+                if "challenges.cloudflare.com" in (f.url or ""):
+                    cf_frame = f
+                    break
+            _try_click_turnstile_frame(page, cf_frame)
+            last_retry_at = time.time()
+            click_count += 1
         time.sleep(0.5)
+
+    log.error(f"❌ Zytrano Turnstile 在 {timeout}s 内未完成验证（已点击 {click_count} 次）。")
+    take_screenshot(page, "zytrano_turnstile_failed")
     return False
 
 
@@ -240,57 +406,139 @@ def is_logged_in_page(page) -> bool:
 
 def login(page, account: dict) -> bool:
     username, password = account["username"], account["password"]
-    for attempt in range(1, 3):
-        if is_logged_in_page(page): return True
-        if not navigate(page, LOGIN_URL): continue
-        if is_logged_in_page(page): return True
+    # 登录前先确保 viewport 就绪
+    ensure_viewport(page)
+
+    for attempt in range(1, 4):  # 增加到 3 次重试
+        if is_logged_in_page(page):
+            return True
+        log.info(f"🔐 Zytrano 登录尝试 ({attempt}/3): {mask(username)}")
+        if not navigate(page, LOGIN_URL):
+            log.warning(f"⚠️ Zytrano 导航到登录页失败（{attempt}/3），CF 拦截未解除")
+            continue
+        # navigate 后再次确保 viewport
+        ensure_viewport(page)
+        if is_logged_in_page(page):
+            return True
 
         try:
-            # 🌟 修复点 1：精准等待带占位符的可视输入框，彻底避开 <input type="hidden"> 坑
-            page.wait_for_selector('input[placeholder]', timeout=8000)
+            # 等待带占位符的可视输入框，彻底避开 <input type="hidden"> 坑
+            try:
+                page.wait_for_selector('input[placeholder]', timeout=10000)
+            except Exception:
+                page.wait_for_selector('input[type="text"], input[type="email"], input[type="password"]', timeout=8000)
             human_delay(0.5, 1.0)
 
             # 阶梯型用户名输入容错
-            try: page.locator('input[placeholder*="Email"], input[placeholder*="Username"]').first.fill(username, timeout=3000)
-            except Exception:
-                try: page.locator('input[name="user"], input[name="username"]').first.fill(username, timeout=2000)
-                except Exception: page.locator('input[type="text"], input').first.fill(username)
+            filled_user = False
+            for sel in [
+                'input[placeholder*="Email"], input[placeholder*="Username"]',
+                'input[name="user"], input[name="username"]',
+                'input[type="email"]',
+                'input[type="text"]',
+            ]:
+                try:
+                    locator = page.locator(sel).first
+                    if locator.is_visible():
+                        locator.fill(username)
+                        filled_user = True
+                        break
+                except Exception:
+                    continue
+            if not filled_user:
+                page.locator('input').first.fill(username)
 
             human_delay(0.3, 0.7)
 
             # 阶梯型密码输入容错
-            try: page.locator('input[placeholder*="Password"]').first.fill(password, timeout=3000)
-            except Exception:
-                try: page.locator('input[name="password"], input[name="pwd"]').first.fill(password, timeout=2000)
-                except Exception: page.locator('input[type="password"]').first.fill(password)
+            filled_pwd = False
+            for sel in [
+                'input[placeholder*="Password"]',
+                'input[name="password"], input[name="pwd"]',
+                'input[type="password"]',
+            ]:
+                try:
+                    locator = page.locator(sel).first
+                    if locator.is_visible():
+                        locator.fill(password)
+                        filled_pwd = True
+                        break
+                except Exception:
+                    continue
+            if not filled_pwd:
+                page.locator('input[type="password"]').first.fill(password)
 
             human_delay(0.5, 1.0)
 
+            # 处理 Turnstile
             cf_passed = click_turnstile_checkbox(page)
             if not cf_passed:
-                log.error(f"❌ [账号: {mask(username)}] 本轮 Turnstile 未通过，放弃提交表单触发重试。")
-                take_screenshot(page, f"login_cf_failed_{username[:4]}")
-                continue 
+                log.error(f"❌ [账号: {mask(username)}] 本轮 Turnstile 未通过（{attempt}/3），放弃提交。")
+                take_screenshot(page, f"login_cf_failed_{username[:4]}_{attempt}")
+                continue
 
             human_delay(0.4, 0.9)
-            try: page.get_by_role("button", name=re.compile("Sign In|Login", re.I)).click(timeout=3000)
-            except Exception: page.locator("button[type='submit'], button").first.click()
 
-            page.wait_for_url(lambda url: any(k in url for k in LOGGED_IN_URL_KEYS), timeout=25000)
-            return True
+            # 点击登录按钮（多层容错）
+            submit_clicked = False
+            for btn_try in [
+                lambda: page.get_by_role("button", name=re.compile("Sign In|Login", re.I)).click(timeout=3000),
+                lambda: page.locator("button[type='submit']").first.click(timeout=3000),
+                lambda: page.locator("button").first.click(timeout=3000),
+            ]:
+                try:
+                    btn_try()
+                    submit_clicked = True
+                    break
+                except Exception:
+                    continue
+
+            if not submit_clicked:
+                log.warning(f"⚠️ 登录按钮点击均失败（{attempt}/3），按 Enter 提交...")
+                try:
+                    page.locator('input[type="password"]').first.press("Enter")
+                except Exception:
+                    pass
+
+            # 等待跳转到已登录页
+            try:
+                page.wait_for_url(
+                    lambda url: any(k in url for k in LOGGED_IN_URL_KEYS),
+                    timeout=28000,
+                )
+                log.info(f"✅ Zytrano 登录成功: {mask(username)}")
+                return True
+            except Exception:
+                if is_logged_in_page(page):
+                    log.info(f"✅ Zytrano 登录成功（body 判定）: {mask(username)}")
+                    return True
+                log.warning(f"⚠️ 登录后未跳转到已登录页（{attempt}/3）")
+                take_screenshot(page, f"login_not_finished_{username[:4]}_{attempt}")
+
         except Exception as ex:
-            log.warning(f"当前登录重试序列异常（{attempt}/2）: {ex}")
-            if is_logged_in_page(page): return True
+            log.warning(f"当前登录重试序列异常（{attempt}/3）: {ex}")
+            if is_logged_in_page(page):
+                return True
+
+        if attempt < 3:
+            time.sleep(random.uniform(2.0, 4.0))
+
     return False
 
 
 # ── 服务器结构拉取 ─────────────────────────────────────────
 def get_servers_info(page) -> list[dict]:
     if not navigate(page, SERVERS_URL): return []
-    time.sleep(3)
+    # 等待页面中至少出现一个 handleServerRenew 标记，最长等 15 秒
+    deadline_gs = time.time() + 15
+    while time.time() < deadline_gs:
+        html_probe = js_eval(page, "() => document.body.innerHTML") or ""
+        if "handleServerRenew" in html_probe:
+            break
+        time.sleep(1)
     js_eval(page, "window.scrollTo(0, document.body.scrollHeight);")
     time.sleep(1)
-    
+
     html = js_eval(page, "() => document.body.innerHTML") or ""
     server_ids = re.findall(r"handleServerRenew\(['\"]([^\'\"]+)[\'\"]\)", html)
 
@@ -400,6 +648,7 @@ def click_renew_button(page, server: dict) -> bool:
 
     if isinstance(probe, dict) and probe.get("found"):
         try:
+            ensure_viewport(page)
             x, y = float(probe["x"]), float(probe["y"])
             page.mouse.move(x, y)
             time.sleep(random.uniform(0.2, 0.5))
@@ -419,7 +668,8 @@ def click_renew_button(page, server: dict) -> bool:
 def wait_for_renew_notice(page, timeout: int = RENEW_NOTICE_TIMEOUT) -> dict:
     """抓取右上角/Toast 通知，作为续期成功或失败的主判定来源。"""
     success_re = re.compile(r"server\s+renewed|renewed\s+successfully|successfully\s+renewed|renewal\s+successful", re.I)
-    fail_re = re.compile(r"renew(?:al)?\s+failed|failed\s+to\s+renew|not\s+renewed|error|unable|cancel(?:led|lation|ing)", re.I)
+    # 注意：不使用裸词 "error"/"unable"，避免误匹配页面无关内容（如广告加载错误）
+    fail_re = re.compile(r"renew(?:al)?\s+failed|failed\s+to\s+renew|not\s+renewed|renew(?:al)?\s+error|unable\s+to\s+renew|cancel(?:led|lation|ing)\s+renew|renew\s+cancel", re.I)
     deadline = time.time() + timeout
     last_candidates = []
     while time.time() < deadline:
@@ -637,9 +887,22 @@ def run_for_account(page, account: dict) -> str:
         renew_notice = wait_for_renew_notice(page, timeout=RENEW_NOTICE_TIMEOUT)
         
         time.sleep(2)
-        navigate(page, SERVERS_URL)
+        if not navigate(page, SERVERS_URL):
+            log.warning(f"⚠️ 续期后刷新服务器列表页失败，仅凭 renew_notice 判定结果")
+            # navigate 失败时 new_days 未知，用 old_days 占位，让 judge 仅凭 notice 判定
+            _nav_success, _nav_label, _nav_note = judge_renew_result(
+                old_days, old_days, confirm_clicked, renew_notice
+            )
+            results.append({
+                "name": s["name"],
+                "success": _nav_success,
+                "status_label": _nav_label,
+                "time_str": "刷新失败",
+                "note": _nav_note + "；续期后无法导航回服务器列表页",
+            })
+            continue
         time.sleep(2)
-        
+
         updated_list = get_servers_info(page)
         
         matched_server = None
